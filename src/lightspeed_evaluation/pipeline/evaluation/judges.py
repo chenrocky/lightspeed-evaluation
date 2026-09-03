@@ -1,6 +1,7 @@
 """Judge orchestration module - handles multi-judge evaluation and aggregation."""
 
 import logging
+import time
 from statistics import mean
 from typing import Any, Callable, Optional
 
@@ -202,19 +203,18 @@ class JudgeOrchestrator:
 
         try:
             handler = self._get_handler_for_judge(framework, judge_manager)
+            t0 = time.time()
             score, reason = handler.evaluate(
                 metric_name, request.conv_data, evaluation_scope
             )
+            elapsed = time.time() - t0
             judge_input_tokens, judge_output_tokens = token_tracker.get_judge_counts()
             embedding_tokens = token_tracker.get_embedding_counts()
 
-            logger.debug(
-                "Judge %s: score=%s, tokens=%d/%d, embeddings=%d",
-                judge_id,
-                score,
-                judge_input_tokens,
-                judge_output_tokens,
-                embedding_tokens,
+            logger.info(
+                "[eval] judge=%s metric=%s:%s score=%s %.1fs tokens=%d/%d",
+                judge_id, framework, metric_name, score, elapsed,
+                judge_input_tokens, judge_output_tokens,
             )
 
             return JudgeScore(
@@ -227,9 +227,11 @@ class JudgeOrchestrator:
             )
 
         except EvaluationError as e:
-            # Catch expected evaluation errors (LLM errors, metric errors, etc.)
-            # Let unexpected exceptions (ConfigurationError, bugs) propagate
-            logger.error("Judge %s failed: %s", judge_id, e)
+            elapsed = time.time() - t0
+            logger.error(
+                "[eval] judge=%s metric=%s:%s FAILED %.1fs error=%s",
+                judge_id, framework, metric_name, elapsed, e,
+            )
             judge_input_tokens, judge_output_tokens = token_tracker.get_judge_counts()
             embedding_tokens = token_tracker.get_embedding_counts()
 

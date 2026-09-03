@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+import json
 import logging
+import os
 from typing import TYPE_CHECKING, Optional
 
 from lightspeed_evaluation.core.models.data import EvaluationData, EvaluationResult
@@ -13,6 +15,8 @@ if TYPE_CHECKING:
     from lightspeed_evaluation.core.models.system import SystemConfig
 
 logger = logging.getLogger(__name__)
+
+INCREMENTAL_RESULTS_FILENAME = ".results.jsonl"
 
 
 class FileStorageBackend(BaseStorageBackend):
@@ -43,10 +47,38 @@ class FileStorageBackend(BaseStorageBackend):
         """Return the name of this storage backend."""
         return "file"
 
+    @property
+    def _output_dir(self) -> str:
+        return self._output_dir_override or self._file_config.output_dir
+
+    @property
+    def _incremental_path(self) -> str:
+        return os.path.join(self._output_dir, INCREMENTAL_RESULTS_FILENAME)
+
     def initialize(self, run_info: RunInfo) -> None:
-        """Start a new run; clear accumulated results."""
+        """Start a new run; load any previously saved incremental results."""
         self._run_info = run_info
         self._accumulated.clear()
+        self._load_incremental_results()
+
+    def _load_incremental_results(self) -> None:
+        """Load results from a previous interrupted run."""
+        path = self._incremental_path
+        if not os.path.exists(path):
+            return
+        count = 0
+        with open(path) as f:
+            for line in f:
+                line = line.strip()
+                if line:
+                    self._accumulated.append(
+                        EvaluationResult.model_validate(json.loads(line))
+                    )
+                    count += 1
+        if count:
+            logger.info(
+                "Loaded %d results from previous run (%s)", count, path
+            )
 
     def set_evaluation_context(
         self, evaluation_data: Optional[list[EvaluationData]] = None
@@ -55,8 +87,12 @@ class FileStorageBackend(BaseStorageBackend):
         self._evaluation_data = evaluation_data
 
     def save_run(self, results: list[EvaluationResult]) -> None:
-        """Accumulate batch results; reports are written in :meth:`finalize`."""
+        """Accumulate results and persist incrementally to JSONL."""
         self._accumulated.extend(results)
+        os.makedirs(self._output_dir, exist_ok=True)
+        with open(self._incremental_path, "a") as f:
+            for result in results:
+                f.write(json.dumps(result.model_dump()) + "\n")
 
     def finalize(self) -> None:
         """Generate reports from accumulated results."""

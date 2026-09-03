@@ -1,8 +1,12 @@
 """Ragas metrics evaluation using LLM Manager with Ragas 0.4+ API."""
 
+import asyncio
 import errno
+import logging
 import math
 from typing import Any, Optional
+
+logger = logging.getLogger(__name__)
 
 import litellm
 from litellm.caching.caching import Cache
@@ -22,6 +26,45 @@ from lightspeed_evaluation.core.llm.litellm_patch import litellm_state_lock
 from lightspeed_evaluation.core.llm.manager import LLMManager
 from lightspeed_evaluation.core.llm.ragas import RagasLLMManager
 from lightspeed_evaluation.core.models import EvaluationScope, TurnData
+
+
+def _safe_asyncio_run(coro):
+    """Run a coroutine with suppressed event loop teardown errors.
+
+    litellm's AsyncHTTPHandler registers cleanup tasks on the event loop
+    created by asyncio.run(). When the loop closes, those tasks fail with
+    RuntimeError('Event loop is closed'). This is cosmetic — the metric
+    result is already captured — but the errors accumulate and can crash
+    long-running evaluations.
+    """
+    loop = asyncio.new_event_loop()
+    loop.set_exception_handler(_suppress_loop_teardown_errors)
+    try:
+        asyncio.set_event_loop(loop)
+        return loop.run_until_complete(coro)
+    finally:
+        try:
+            _cancel_all_tasks(loop)
+            loop.run_until_complete(loop.shutdown_asyncgens())
+            loop.run_until_complete(loop.shutdown_default_executor())
+        finally:
+            asyncio.set_event_loop(None)
+            loop.close()
+
+
+def _cancel_all_tasks(loop):
+    to_cancel = asyncio.all_tasks(loop)
+    if not to_cancel:
+        return
+    for task in to_cancel:
+        task.cancel()
+    loop.run_until_complete(asyncio.gather(*to_cancel, return_exceptions=True))
+
+
+def _suppress_loop_teardown_errors(loop, context):
+    if "Event loop is closed" in str(context.get("exception", "")):
+        return
+    loop.default_exception_handler(context)
 
 
 def _clamp_score(score: float) -> float:
@@ -130,6 +173,8 @@ class RagasMetrics:  # pylint: disable=too-few-public-methods
             return None, err_msg
         except (RuntimeError, ValueError, TypeError, ImportError) as e:
             return None, f"Ragas {metric_name} evaluation failed: {str(e)}"
+        except Exception as e:
+            return None, f"Ragas {metric_name} evaluation failed: {type(e).__name__}: {str(e)}"
 
         if result[0] is not None and math.isnan(result[0]):
             return (
@@ -158,7 +203,7 @@ class RagasMetrics:  # pylint: disable=too-few-public-methods
             embeddings=self.embedding_manager.embeddings,
         )
 
-        result = metric.score(user_input=query, response=response)
+        result = _safe_asyncio_run(metric.ascore(user_input=query, response=response))
 
         score = _clamp_score(float(result.value))
         return score, f"Ragas response relevancy: {score:.2f}"
@@ -178,11 +223,11 @@ class RagasMetrics:  # pylint: disable=too-few-public-methods
 
         metric = Faithfulness(llm=self.llm_manager.get_llm())
 
-        result = metric.score(
+        result = _safe_asyncio_run(metric.ascore(
             user_input=query,
             response=response,
             retrieved_contexts=contexts,
-        )
+        ))
 
         score = _clamp_score(float(result.value))
         return score, f"Ragas faithfulness: {score:.2f}"
@@ -202,11 +247,11 @@ class RagasMetrics:  # pylint: disable=too-few-public-methods
 
         metric = ContextUtilization(llm=self.llm_manager.get_llm())
 
-        result = metric.score(
+        result = _safe_asyncio_run(metric.ascore(
             user_input=query,
             response=response,
             retrieved_contexts=contexts,
-        )
+        ))
 
         score = _clamp_score(float(result.value))
         return score, f"Ragas context precision without reference: {score:.2f}"
@@ -229,11 +274,11 @@ class RagasMetrics:  # pylint: disable=too-few-public-methods
 
         metric = ContextPrecision(llm=self.llm_manager.get_llm())
 
-        result = metric.score(
+        result = _safe_asyncio_run(metric.ascore(
             user_input=query,
             reference=turn_data.expected_response or "",
             retrieved_contexts=contexts,
-        )
+        ))
 
         score = _clamp_score(float(result.value))
         return score, f"Ragas context precision with reference: {score:.2f}"
@@ -256,11 +301,11 @@ class RagasMetrics:  # pylint: disable=too-few-public-methods
 
         metric = ContextRecall(llm=self.llm_manager.get_llm())
 
-        result = metric.score(
+        result = _safe_asyncio_run(metric.ascore(
             user_input=query,
             retrieved_contexts=contexts,
             reference=turn_data.expected_response or "",
-        )
+        ))
 
         score = _clamp_score(float(result.value))
         return score, f"Ragas context recall: {score:.2f}"
@@ -280,10 +325,10 @@ class RagasMetrics:  # pylint: disable=too-few-public-methods
 
         metric = ContextRelevance(llm=self.llm_manager.get_llm())
 
-        result = metric.score(
+        result = _safe_asyncio_run(metric.ascore(
             user_input=query,
             retrieved_contexts=contexts,
-        )
+        ))
 
         score = _clamp_score(float(result.value))
         return score, f"Ragas context relevance: {score:.2f}"

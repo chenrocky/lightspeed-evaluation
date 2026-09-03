@@ -3,6 +3,7 @@
 import asyncio
 import concurrent.futures
 import logging
+import os
 from typing import Optional
 
 import litellm
@@ -172,6 +173,24 @@ class EvaluationPipeline:
         logger.info("Evaluation complete: %d results generated", len(results))
         return results
 
+    CHECKPOINT_FILENAME = ".completed_ids"
+
+    def _checkpoint_path(self) -> str:
+        return os.path.join(self.output_dir, self.CHECKPOINT_FILENAME)
+
+    def get_completed_ids(self) -> set[str]:
+        """Read completed conversation IDs from checkpoint file."""
+        path = self._checkpoint_path()
+        if not os.path.exists(path):
+            return set()
+        with open(path) as f:
+            return {line.strip() for line in f if line.strip()}
+
+    def _save_checkpoint(self, conv_id: str) -> None:
+        """Append a completed conversation ID to the checkpoint file."""
+        with open(self._checkpoint_path(), "a") as f:
+            f.write(conv_id + "\n")
+
     def _process_eval_data(
         self, evaluation_data: list[EvaluationData]
     ) -> list[EvaluationResult]:
@@ -179,22 +198,43 @@ class EvaluationPipeline:
         with concurrent.futures.ThreadPoolExecutor(
             max_workers=self.system_config.core.max_threads
         ) as executor:
-            futures = (
-                executor.submit(self.conversation_processor.process_conversation, c)
+            future_to_conv = {
+                executor.submit(
+                    self.conversation_processor.process_conversation, c
+                ): c.conversation_group_id
                 for c in evaluation_data
-            )
+            }
             results: list[EvaluationResult] = []
+            failed_conversations = 0
             for future in tqdm.tqdm(
-                concurrent.futures.as_completed(futures), total=len(evaluation_data)
+                concurrent.futures.as_completed(future_to_conv),
+                total=len(evaluation_data),
             ):
-                conversation_results = future.result()
-                # Batch save results per conversation (more efficient than individual saves)
+                conv_id = future_to_conv[future]
+                try:
+                    conversation_results = future.result()
+                except Exception:
+                    failed_conversations += 1
+                    logger.exception(
+                        "Conversation %s failed with exception; "
+                        "continuing with remaining conversations",
+                        conv_id,
+                    )
+                    continue
                 if conversation_results:
                     try:
                         self.storage_backend.save_run(conversation_results)
                     except StorageError as e:
-                        logger.warning("Failed to save results to storage: %s", e)
+                        logger.warning(
+                            "Failed to save results to storage: %s", e
+                        )
                 results.extend(conversation_results)
+                self._save_checkpoint(conv_id)
+            if failed_conversations:
+                logger.warning(
+                    "%d conversation(s) failed during evaluation",
+                    failed_conversations,
+                )
             return results
 
     def _save_amended_data(self, evaluation_data: list[EvaluationData]) -> None:
